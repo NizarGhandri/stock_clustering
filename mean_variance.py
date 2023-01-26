@@ -4,11 +4,9 @@ import os
 from utils import compute_clean_correlation_matrix
 from tqdm.contrib.concurrent import process_map
 from tqdm import tqdm
-from numba import jit, typeof
-import logging
-
-numba_logger = logging.getLogger('numba')
-numba_logger.setLevel(logging.DEBUG)
+from numba import jit
+from clustering import LouvainClustering
+from dtaidistance import dtw
 
 
 @jit(nopython=True, nogil=True)
@@ -29,7 +27,7 @@ def optimal_weights_constrained(average_returns, correlation_matrix, risk_aversi
 class Markowitz():
 
 
-    def __init__(self, cfg, risk_aversion=2, window_size=367, stride=10, C = 0.1, clustering=None):  
+    def __init__(self, cfg, risk_aversion=2, window_size=367, stride=10, C = 0.1, clustering=None, type_dist="corr"):  
         self.cfg = cfg 
         self.risk_aversion = risk_aversion
         self.data = self.load_data()
@@ -38,6 +36,8 @@ class Markowitz():
         self.stride = stride
         self.C = C
         self.clustering = clustering
+        self.__generated_clusters = []
+        self.type = type_dist
 
 
 
@@ -66,81 +66,155 @@ class Markowitz():
         windowed_return = self.returns.iloc[i-self.window_size:i]
         _, clean_corr = compute_clean_correlation_matrix(windowed_return)
         return_estimators = windowed_return.mean(axis=0).to_numpy()[:, np.newaxis]
-        optimal_weights = self.optimal_weights(return_estimators, clean_corr, risk_aversion)
-        return np.array(optimal_weights).reshape(-1)
+        op = optimal_weights(return_estimators, clean_corr, risk_aversion)
+        return np.array(op).reshape(-1)
 
-  
+    
+    def get_clustering_corr(self, i):
+
+        if self.clustering is None:
+            windowed_return = self.returns.iloc[i-self.window_size:i].to_numpy()
+            is_var = windowed_return.std(axis=0) > 0.0
+            corr = np.corrcoef(windowed_return[:, is_var].T)
+            np.fill_diagonal(corr, 1)
+            n = self.returns.shape[1]
+            clean_corr = np.zeros((n , n))
+            a = compute_clean_correlation_matrix(corr, corr.shape[1], windowed_return.shape[0])
+            j = 0
+            if  (1 - is_var).sum():
+                for i in range(len(clean_corr)):
+                    if is_var[i]:
+                        clean_corr[i, is_var] = a[j, :]
+                        j = j + 1
+                np.fill_diagonal(clean_corr, 1)
+            else:
+                clean_corr = a
+            return LouvainClustering(clean_corr).cluster()
+        return self.clustering[i]
+
+
+    def get_clustering_dtw(self, i):
+
+        if self.clustering is None:
+            windowed_return = self.returns.iloc[i-self.window_size:i].to_numpy()
+            clean_corr = self.pairwise_dtw(windowed_return)
+            return LouvainClustering(clean_corr).cluster()
+        return self.clustering[i]
+
     
     def clustered_rolling(self, i):
 
-        print("cluster")
-        clusters = self.clustering[i]
+
+
+        cluster = self.get_clustering_corr if self.type == "corr" else self.get_clustering_dtw
+        clusters = list(map(list, cluster(i)))
         return_clusters = []
+        aggregation_weights = []
         for cluster in clusters:
             windowed_return = self.returns.iloc[i-self.window_size:i, cluster].to_numpy()
-            corr = np.cov(windowed_return.T)
-            clean_corr = compute_clean_correlation_matrix(corr, corr.shape[1], windowed_return.shape[0]) 
-            clean_corr = np.array(clean_corr) 
-            return_estimators = np.mean(windowed_return, axis=0).T
-            op = optimal_weights(return_estimators, clean_corr)
-            return_clusters.append(windowed_return@op)
+            if len(cluster) > 1:
+                corr = np.cov(windowed_return.T)
+                clean_corr = compute_clean_correlation_matrix(corr, corr.shape[1], windowed_return.shape[0]) 
+                clean_corr = np.array(clean_corr) 
+                return_estimators = np.mean(windowed_return, axis=0).T
+                op = optimal_weights_constrained(return_estimators, clean_corr, self.risk_aversion, 0.1)
+                aggregation_weights.append(op)
+                return_clusters.append((windowed_return@op)[:, np.newaxis])
+            else:
+                aggregation_weights.append(np.ones((1,1)))
+                return_clusters.append(windowed_return)
 
-        return_cluster = np.concatenate(return_clusters, axis=1)
-        corr = np.cov(windowed_return.T)
+        
+        return_clusters = np.concatenate(return_clusters, axis=1)
+        corr = np.cov(return_clusters.T)
         clean_corr = compute_clean_correlation_matrix(corr, corr.shape[1], windowed_return.shape[0]) 
-        clean_corr = np.array(clean_corr) 
-        op = optimal_weights(return_cluster.mean(axis=0)[:, np.newaxis], clean_corr)
-        return op
+        op = optimal_weights_constrained(return_clusters.mean(axis=0)[:, np.newaxis], clean_corr, self.risk_aversion, 0.01)
+        return op, aggregation_weights, clusters
 
 
     
  
     def compiled_rolling(self, i):
-        #for i in tqdm(windows):
         windowed_return = self.returns.iloc[i-self.window_size:i].to_numpy()
-        #is_var = windowed_return.std(axis=0) > 0.0
-        corr = np.cov(windowed_return.T)#[is_var, :][:, is_var]
-        #corr[np.isnan(corr)] = 0.0
-        #np.fill_diagonal(corr, 1)
-        #clean_corr = np.zeros((self.returns.shape[1], self.returns.shape[1]))
+        corr = np.cov(windowed_return.T)
         clean_corr = compute_clean_correlation_matrix(corr, corr.shape[1], windowed_return.shape[0]) 
-        clean_corr = np.array(clean_corr) #* (np.array(clean_corr) >= 0.0001).astype(float)
-        # print((a > 0.0001).sum())
-        # j = 0
-        # if  (1 - is_var).sum():
-        #     for i in range(len(clean_corr)):
-        #         if is_var[i]:
-        #             clean_corr[i, is_var] = a[j, :]
-        #             j = j + 1
-        #     np.fill_diagonal(clean_corr, 1)
-        # else:
-        # clean_corr = a
-
-        # print(clean_corr, (clean_corr >= 0.0001).astype(float))
-        #clean_corr[is_var, :][:, is_var] = compute_clean_correlation_matrix(corr, corr.shape[1], windowed_return.shape[0])
-        #np.fill_diagonal(clean_corr, 1)
+        clean_corr = np.array(clean_corr) 
         return_estimators = np.mean(windowed_return, axis=0).T
         print(np.linalg.norm(clean_corr))
         op = optimal_weights_constrained(return_estimators, clean_corr, self.risk_aversion, self.C)
         return np.array(op).reshape(-1)
-        #return [self.rolling_optimal_weights(i, risk_aversion=risk_aversion) for i in windows]
+       
             
         
 
-    def get_rolling_cumulative_return(self, parallel=False, cluster=False):
-        windows = list(range(self.window_size, len(self.returns)-self.stride, self.stride))
-        rolling_comp = self.clustered_rolling if cluster else self.compiled_rolling
-        print(windows[-1], rolling_comp)
+    def get_rolling_cumulative_return(self, parallel=False):
+        windows = list(range(self.window_size, len(self.returns)-self.stride+1, self.stride))
+        #rolling_comp = self.clustered_rolling if cluster else self.compiled_rolling
+        #print(windows[-1], self.compiled_rolling)
         if parallel:
-            weights = process_map(rolling_comp, windows, max_workers=os.cpu_count()//4, chunksize = 25)
+            weights = process_map(self.compiled_rolling, windows, max_workers=os.cpu_count()//4, chunksize = 25)
         else:
-            weights = [rolling_comp(i) for i in tqdm(windows, position=0, leave=True)]
+            weights = [self.compiled_rolling(i) for i in tqdm(windows, position=0, leave=True)]
 
-        self.weights = [weights[0]]*(self.window_size + 1 + self.stride) + [weight for weight in weights[1:] for _ in range(self.stride)]
-        print(len(self.weights))
+        self.weights = [weight for weight in weights for _ in range(self.stride)] #[weights[0]]*(self.window_size + self.stride) + 
+        #print(len(self.weights))
         self.weights = np.array(self.weights)[:self.returns.shape[0]]
+        ret = (self.returns.to_numpy() + 1)[self.window_size:]    
+        return pd.DataFrame((ret*self.weights).sum(axis=1), index=self.returns.index[self.window_size:]).cumprod()
+
+
+    def get_clustered_cumulative_return(self, parallel=False):
+        windows = list(range(self.window_size, len(self.returns)-self.stride+1, self.stride))
+        if parallel:
+            weights = process_map(self.clustered_rolling, windows, max_workers=os.cpu_count()//4, chunksize = 25)
+        else:
+            weights = [self.clustered_rolling(i) for i in tqdm(windows, position=0, leave=True)]
+
+        self.weights, self.aggregation_weights, self.__generated_clusters = list(zip(*weights))
+        cum_ret = self.returns.to_numpy() + 1
+        cum_return = []
+        print(len(self.__generated_clusters), len(self.aggregation_weights), len(self.weights), len(windows))
+        for window, time_clusters, intra_cluster_weights, inter_cluster_weights in zip(windows, self.__generated_clusters, self.aggregation_weights, self.weights):
+            
+            X = cum_ret[window: window+self.stride]
+            cum_return.append(sum([((X[:, cluster] @ w_inter) * w_intra).reshape(-1, 1) for cluster, w_inter, w_intra in zip(time_clusters, intra_cluster_weights, inter_cluster_weights)]))
+            
         
-        return pd.DataFrame(((self.returns.to_numpy() + 1)*self.weights).sum(axis=1), index=self.returns.index).cumprod()
+
+        print(len(cum_return))
+        print(cum_return[-1])
+        print(cum_return[-1].shape)
+
+        cum_return = np.concatenate(cum_return) #[_ for elem in cum_return for _ in elem]
+        print(np.array(cum_return).shape)
+        return pd.DataFrame(np.array(cum_return), index=self.returns.index[self.window_size:]).cumprod()
+
+
+    def pairwise_dtw(self, time_period):
+        is_var = time_period.std(axis=0) > 0.0
+        ds = dtw.distance_matrix(time_period[:, is_var].T, only_triu=True, use_c=True, parallel=True)
+        np.fill_diagonal(ds, 1)
+        ds[ds == np.inf] = 0
+        #ds_ = np.copy(ds)
+        ds = ds + ds.T
+        ds = 1/ds
+        np.fill_diagonal(ds, 0)
+        #np.corrcoef(.T)[is_var, :][:, is_var]
+        #corr[np.isnan(corr)] = 0.0
+        n = self.returns.shape[1]
+        clean_corr = np.zeros((n, n))
+        a = ds
+        j = 0
+        if  (1 - is_var).sum():
+            for i in range(len(clean_corr)):
+                if is_var[i]:
+                    clean_corr[i, is_var] = a[j, :]
+                    j = j + 1
+            np.fill_diagonal(clean_corr, 1)
+        else:
+            clean_corr = a
+
+        return clean_corr
 
     
 
