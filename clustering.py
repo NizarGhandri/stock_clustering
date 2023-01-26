@@ -16,4 +16,4 @@ class LouvainClustering:
    
 
     def cluster(self, ):
-        return nx.algorithms.community.louvain_communities(self.graph, resolution=i)
+        return nx.algorithms.community.louvain_communities(self.graph, resolution=self.resolution)

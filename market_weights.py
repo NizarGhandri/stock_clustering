@@ -32,6 +32,7 @@ class MarketWeighted():
         return self.preprocess(pd.concat([pd.read_parquet(os.path.join(self.cfg.data_dir, f))["Close"] for f in files], join="inner").sort_values(by="Date", axis=0))
 
     def preprocess(self, x, percent0=0.7, percent1=0.5):
+        x = x.drop(columns=["AMZN", "GOOGL", "GOOG"])
         tmp = x.dropna(thresh=int(percent0*x.shape[1])).dropna(axis=1, thresh=int(percent1*x.shape[0])).fillna(method="ffill")
         dropped = set(x.columns) - set(tmp.columns) 
         logging.info("Preprocessing dropped the following stocks %s ".format(["-".join(list(dropped))]))

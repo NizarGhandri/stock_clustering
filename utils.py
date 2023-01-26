@@ -23,7 +23,7 @@ def eigen_cleaner(eigenvalues,eigenvectors,lambda_plus):
         cleaned_correlation_matrix=cleaned_correlation_matrix+ a
         
     cleaned_correlation_matrix = np.real(cleaned_correlation_matrix)
-    np.fill_diagonal(cleaned_correlation_matrix,1)
+    #np.fill_diagonal(cleaned_correlation_matrix,1)
 
     
     return np.clip(cleaned_correlation_matrix, -1, 1)
