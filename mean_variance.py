@@ -104,7 +104,7 @@ class Markowitz():
     
     def clustered_rolling(self, i):
 
-
+        print(self.type, self.type == "corr")
 
         cluster = self.get_clustering_corr if self.type == "corr" else self.get_clustering_dtw
         clusters = list(map(list, cluster(i)))
